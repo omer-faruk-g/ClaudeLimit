@@ -1,0 +1,206 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+"""ClaudeCtx shared helpers: config, transcript reading, handoff paths. Stdlib only."""
+import hashlib
+import json
+import os
+import re
+from datetime import datetime
+
+B = chr(92)  # backslash, kept out of literals so the file reads the same everywhere
+
+DEFAULTS = {
+    "soft": 120000,              # first warning: hand off at the next task boundary
+    "hard": 200000,              # strong warning: finish the current step, then hand off
+    "step": 50000,               # warn again every `step` tokens above `hard`
+    "idle_minutes": 60,          # gap after which the prompt cache has likely expired
+    "idle_min_context": 60000,   # ignore idle gaps for small contexts
+    "handoff_max_age_days": 7,   # SessionStart mentions only handoffs newer than this
+    "autoload_minutes": 30,      # after /clear, load a note this fresh in full (the core context)
+}
+
+
+def home_dir(home=None):
+    return home or os.environ.get("CLAUDECTX_HOME") or os.path.expanduser("~")
+
+
+def long_path(path):
+    """Windows MAX_PATH workaround: Claude Code project dirs can exceed 260 chars."""
+    ap = os.path.abspath(path)
+    if os.name != "nt" or len(ap) < 250 or ap.startswith(B + B):
+        return ap
+    return B + B + "?" + B + ap
+
+
+def load_config(home=None):
+    cfg = dict(DEFAULTS, auto_clear=True)  # auto_clear: Claude clears the session itself after the handoff
+    p = os.path.join(home_dir(home), ".claude", "claudectx.json")
+    try:
+        with open(p, encoding="utf-8") as f:
+            user = json.load(f)
+    except (OSError, ValueError):
+        return cfg
+    if not isinstance(user, dict):
+        return cfg
+    for k, v in user.items():
+        if k in DEFAULTS and isinstance(v, int) and not isinstance(v, bool) and v >= 0:
+            cfg[k] = v
+    if user.get("lang") in ("en", "tr"):
+        cfg["lang"] = user["lang"]
+    if isinstance(user.get("auto_clear"), bool):
+        cfg["auto_clear"] = user["auto_clear"]
+    return cfg
+
+
+def context_of(usage):
+    """Tokens the request carried: uncached input + cache reads + cache writes."""
+    return sum(usage.get(k) or 0 for k in ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"))
+
+
+def parse_ts(ts):
+    try:
+        return datetime.fromisoformat(str(ts).replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
+def project_key(cwd):
+    key = re.sub(r"[^A-Za-z0-9]", "-", os.path.abspath(cwd or "."))
+    if len(key) > 100:
+        key = key[-80:].lstrip("-") + "-" + hashlib.sha1(key.encode("utf-8")).hexdigest()[:8]
+    return key
+
+
+def handoff_path(cwd, home=None):
+    return os.path.normpath(os.path.join(home_dir(home), ".claude", "handoffs", project_key(cwd) + ".md"))
+
+
+def last_context(transcript_path, max_bytes=8 * 1024 * 1024):
+    """Context size of the latest main-conversation request, read from the end of the transcript.
+
+    Returns (tokens, unix_ts) or (None, None). The latest assistant usage gives the context of
+    the last request plus its output; a later compact_boundary gives the post-compaction size.
+    """
+    try:
+        f = open(long_path(transcript_path), "rb")
+    except (OSError, TypeError, ValueError):
+        return None, None
+    with f:
+        f.seek(0, os.SEEK_END)
+        size = f.tell()
+        chunk = 256 * 1024
+        while True:
+            start = max(0, size - chunk)
+            f.seek(start)
+            data = f.read(size - start)
+            lines = data.split(b"\n")
+            if start > 0:
+                lines = lines[1:]  # first line may be cut
+            for raw in reversed(lines):
+                if not raw.strip():
+                    continue
+                try:
+                    d = json.loads(raw)
+                except ValueError:
+                    continue
+                if d.get("isSidechain"):
+                    continue
+                if d.get("type") == "system" and d.get("subtype") == "compact_boundary":
+                    post = (d.get("compactMetadata") or {}).get("postTokens")
+                    if isinstance(post, int):
+                        return post, parse_ts(d.get("timestamp"))
+                if d.get("type") == "assistant":
+                    u = (d.get("message") or {}).get("usage")
+                    if u:
+                        return context_of(u) + (u.get("output_tokens") or 0), parse_ts(d.get("timestamp"))
+            if start == 0 or chunk >= max_bytes:
+                return None, None
+            chunk *= 4
+
+
+def iter_requests(projects_root):
+    """Yield one dict per main-conversation API request in every transcript (deduped by message id)."""
+    import glob
+    seen = set()  # across files: when the app moves a session's folder, its transcript is copied, ids and all
+    for p in sorted(glob.glob(os.path.join(projects_root, "*", "*.jsonl"))):
+        try:
+            f = open(long_path(p), encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        with f:
+            for line in f:
+                if '"usage"' not in line and "compact_boundary" not in line:
+                    continue
+                try:
+                    d = json.loads(line)
+                except ValueError:
+                    continue
+                if d.get("isSidechain"):
+                    continue
+                if d.get("type") == "system" and d.get("subtype") == "compact_boundary":
+                    key = d.get("uuid") or (d.get("sessionId"), d.get("timestamp"))
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    yield {"file": p, "session": d.get("sessionId"), "ts": d.get("timestamp", ""), "compact": True,
+                           "ctx": (d.get("compactMetadata") or {}).get("postTokens") or 0}
+                    continue
+                m = d.get("message") or {}
+                u = m.get("usage")
+                if d.get("type") != "assistant" or not u:
+                    continue
+                mid = m.get("id") or d.get("uuid")
+                if mid in seen or context_of(u) == 0:  # zero usage: synthetic/error entries, not real requests
+                    continue
+                seen.add(mid)
+                yield {"file": p, "session": d.get("sessionId"), "ts": d.get("timestamp", ""), "compact": False,
+                       "ctx": context_of(u), "out": u.get("output_tokens") or 0, "model": m.get("model", "")}
+
+
+def newest_transcript(projects_root):
+    """The most recently written transcript: while a session runs, that is usually its own."""
+    import glob
+    paths = glob.glob(os.path.join(projects_root, "*", "*.jsonl"))
+
+    def mtime(p):  # a long project dir can push the file past MAX_PATH; an unreadable file ranks last
+        try:
+            return os.path.getmtime(long_path(p))
+        except OSError:
+            return -1.0
+    return max(paths, key=mtime) if paths else None
+
+
+_REMINDER = re.compile(r"<(system-reminder|local-command-[a-z]+)>.*?</\1>", re.S)
+_TAG = re.compile(r"</?[A-Za-z][\w-]*[^>]*>")
+
+
+def user_messages(transcript_path):
+    """Yield (unix_ts, text) for each prompt the user typed in the main conversation.
+
+    Skips tool results, injected entries (isMeta, compaction summaries, system reminders)
+    and interrupt markers, so what is left is the user's own words, including the parts
+    of a long session that compaction has already dropped.
+    """
+    try:
+        f = open(long_path(transcript_path), encoding="utf-8", errors="replace")
+    except (OSError, TypeError, ValueError):
+        return
+    with f:
+        for line in f:
+            if '"user"' not in line:
+                continue
+            try:
+                d = json.loads(line)
+            except ValueError:
+                continue
+            if d.get("type") != "user" or d.get("isSidechain") or d.get("isMeta") or d.get("isCompactSummary"):
+                continue
+            c = (d.get("message") or {}).get("content")
+            if isinstance(c, list):
+                if any(isinstance(b, dict) and b.get("type") == "tool_result" for b in c):
+                    continue
+                c = " ".join(b.get("text", "") for b in c if isinstance(b, dict) and b.get("type") == "text")
+            if not isinstance(c, str):
+                continue
+            text = " ".join(_TAG.sub(" ", _REMINDER.sub(" ", c)).split())
+            if text and not text.startswith(("[Request interrupted", "This session is being continued")):
+                yield parse_ts(d.get("timestamp")), text
