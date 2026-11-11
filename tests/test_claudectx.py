@@ -451,5 +451,91 @@ class TestAudit(Base):
         self.assertEqual(st["attachments_chars"]["skill_listing"], len(listing))  # later delta not counted
 
 
+def fable(ctx, ts, mid, sidechain=False, model="claude-fable-5-2"):
+    e = assistant(ctx, ts, mid=mid, sidechain=sidechain)
+    e["message"]["model"] = model
+    return e
+
+
+class TestFableBrake(Base):
+    def run_tool(self, entries, mark=True, tool="Bash", inp=None, cfg=None):
+        tp = self.transcript([])
+        d = dict(self.data(tp), tool_name=tool, tool_input=inp or {"command": "ls"})
+        if mark:
+            ctx_hook.mark_turn(d, home=self.home)  # the prompt arrives before the turn's requests
+        with open(tp, "a", encoding="utf-8", newline="\n") as f:
+            for e in entries:
+                f.write(json.dumps(e) + "\n")
+        return ctx_hook.tool_event(d, cfg or CFG, home=self.home)
+
+    def test_fable_under_limits_allows(self):
+        self.assertEqual(self.run_tool([fable(90000, 1000 + i, f"f{i}") for i in range(24)]), (None, None))
+
+    def test_fable_turn_limit_denies(self):
+        reason, msg = self.run_tool([fable(90000, 1000 + i, f"f{i}") for i in range(25)])
+        self.assertIn("25 Fable requests", reason)
+        self.assertIn("Fable", msg)
+
+    def test_streamed_chunks_count_once(self):
+        e = [fable(90000, 1000 + i, f"f{i // 2}") for i in range(48)]  # 2 transcript lines per request
+        self.assertEqual(self.run_tool(e), (None, None))
+
+    def test_previous_turn_not_counted(self):
+        tp = self.transcript([fable(90000, 1000 + i, f"old{i}") for i in range(40)])
+        d = dict(self.data(tp), tool_name="Bash", tool_input={"command": "ls"})
+        ctx_hook.mark_turn(d, home=self.home)
+        with open(tp, "a", encoding="utf-8", newline="\n") as f:
+            f.write(json.dumps(fable(90000, 2000, "new1")) + "\n")
+        self.assertEqual(ctx_hook.tool_event(d, CFG, home=self.home), (None, None))
+
+    def test_fable_context_limit_denies(self):
+        reason, _ = self.run_tool([fable(125000, 1000, "f1")])
+        self.assertIn("Fable limit 120K", reason)
+
+    def test_opus_never_braked(self):
+        e = [assistant(190000, 1000 + i, mid=f"o{i}") for i in range(60)]
+        self.assertEqual(self.run_tool(e), (None, None))
+
+    def test_switch_back_to_opus_releases(self):
+        e = [fable(130000, 1000 + i, f"f{i}") for i in range(30)] + [assistant(130000, 2000, mid="o1")]
+        self.assertEqual(self.run_tool(e), (None, None))
+
+    def test_fable_subagent_in_opus_session_ignored(self):
+        e = [assistant(90000, 1000, mid="o1")] + [fable(150000, 1001 + i, f"s{i}", sidechain=True) for i in range(30)]
+        self.assertEqual(self.run_tool(e), (None, None))
+
+    def test_handoff_tools_pass_at_context_limit(self):
+        e = [fable(130000, 1000, "f1")]
+        for tool, inp in (("Skill", {"skill": "claudelimit"}),
+                          ("Write", {"file_path": "C:/Users/HP/.claude/handoffs/x.md"}),
+                          ("Bash", {"command": "python ctx_hook.py digest"}),
+                          ("mcp__ccd_session_mgmt__clear_session", {})):
+            self.assertEqual(self.run_tool(e, tool=tool, inp=inp), (None, None), tool)
+        self.assertIsNotNone(self.run_tool(e, tool="Write", inp={"file_path": "C:/proj/a.py"})[0])
+
+    def test_no_turn_mark_still_checks_context(self):
+        e = [fable(90000, 1000 + i, f"f{i}") for i in range(30)]
+        self.assertEqual(self.run_tool(e, mark=False), (None, None))  # count unknown: no turn brake
+        self.assertIsNotNone(self.run_tool([fable(130000, 1000, "f1")], mark=False)[0])
+
+    def test_limits_configurable_and_zero_disables(self):
+        e = [fable(130000, 1000 + i, f"f{i}") for i in range(30)]
+        off = dict(CFG, fable_turn_max=0, fable_hard=0)
+        self.assertEqual(self.run_tool(e, cfg=off), (None, None))
+
+    def test_cli_emits_deny_json_and_never_fails(self):
+        tp = self.transcript([fable(130000, 1000, "f1")])
+        inp = json.dumps({"transcript_path": tp, "session_id": "cli", "tool_name": "Bash", "tool_input": {"command": "ls"}})
+        env = dict(os.environ, USERPROFILE=self.home, HOME=self.home)
+        r = subprocess.run([sys.executable, os.path.join(SCRIPTS, "ctx_hook.py"), "tool"], input=inp.encode(),
+                           capture_output=True, env=env)
+        self.assertEqual(r.returncode, 0)
+        out = json.loads(r.stdout.decode("utf-8"))
+        self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "deny")
+        r = subprocess.run([sys.executable, os.path.join(SCRIPTS, "ctx_hook.py"), "tool"], input=b"not json",
+                           capture_output=True, env=env)
+        self.assertEqual((r.returncode, r.stdout), (0, b""))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=1)

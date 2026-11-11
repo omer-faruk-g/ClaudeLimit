@@ -7,6 +7,8 @@ fields and speaks only when it matters, so below the soft limit it costs 0 token
 
   ctx_hook.py prompt   UserPromptSubmit: warn once per level (soft, hard, then every `step`),
                        and note a likely prompt-cache miss after an idle gap
+  ctx_hook.py tool     PreToolUse: Fable brake, denies tool calls after `fable_turn_max` Fable requests in one
+                       turn or at `fable_hard` context (handoff tools still run); other models: silent
   ctx_hook.py start    SessionStart (startup|clear): in the first session after a handoff is written, load it
                        in full (the core context); otherwise point Claude to a recent one
   ctx_hook.py path     print the handoff path for the current folder (or --cwd DIR)
@@ -259,6 +261,95 @@ def digest(transcript_path, per_msg=240, cap=10000):
     return head + [f"- [... {len(lines) - len(head) - len(tail)} messages omitted ...]"] + tail
 
 
+FABLE_TURN = ("ClaudeLimit Fable brake: this turn already ran {n} Fable requests (limit {max}). Fable drains the "
+              "5-hour limit about 2x faster than Opus. Do not call more tools. Reply to the user now: what is done, "
+              "what is left, and ask whether to continue (their next message allows another {max}).")
+FABLE_CTX = ("ClaudeLimit Fable brake: context is ~{k}K tokens (Fable limit {hard}K) and every Fable request re-sends "
+             "all of it. Only the handoff may run now: invoke the claudelimit skill, run its core-context flow "
+             "(section 3) and clear the session; otherwise stop and tell the user to continue in a new session.")
+FABLE_USER = {"en": "ClaudeLimit: Fable brake ({why}). Say 'devam' to continue, or start a new session.",
+              "tr": "ClaudeLimit: Fable freni ({why}). Sürmek için 'devam' de ya da yeni oturum aç."}
+HANDOFF_TOOLS = ("Skill", "mcp__ccd_session_mgmt__clear_session")
+
+
+def turn_file(session_id, home=None):
+    sid = re.sub(r"[^A-Za-z0-9_-]", "", str(session_id or "nosession"))[:80] or "nosession"
+    return os.path.join(home_dir(home), ".claude", "claudectx-state", "turn-" + sid + ".json")
+
+
+def mark_turn(data, home=None):
+    """UserPromptSubmit: remember where this turn starts in the transcript (the Fable brake counts from here)."""
+    try:
+        size = os.path.getsize(long_path(data.get("transcript_path")))
+    except (OSError, TypeError, ValueError):
+        return
+    tf = turn_file(data.get("session_id"), home)
+    os.makedirs(os.path.dirname(tf), exist_ok=True)
+    with open(tf, "w", encoding="utf-8") as f:
+        json.dump({"offset": size}, f)
+
+
+def turn_requests(path, offset):
+    """(fable_requests, last_model) for main-conversation requests appended after byte `offset`."""
+    try:
+        f = open(long_path(path), "rb")
+    except (OSError, TypeError, ValueError):
+        return 0, None
+    ids, last = set(), None
+    with f:
+        size = f.seek(0, os.SEEK_END)
+        if not isinstance(offset, int) or not 0 <= offset <= size:
+            offset = max(0, size - 256 * 1024)  # no turn mark: look at the tail only for the model
+            count = False
+        else:
+            count = True
+        f.seek(offset)
+        for raw in f.read().split(b"\n"):
+            if b'"assistant"' not in raw:
+                continue
+            try:
+                d = json.loads(raw)
+            except ValueError:
+                continue
+            if d.get("type") != "assistant" or d.get("isSidechain"):
+                continue
+            m = d.get("message") or {}
+            last = m.get("model") or last
+            if count and "fable" in str(m.get("model")):
+                ids.add(m.get("id"))
+    return len(ids), last
+
+
+def handoff_call(data):
+    name = data.get("tool_name") or ""
+    inp = data.get("tool_input") or {}
+    if name in HANDOFF_TOOLS:
+        return True
+    if name in ("Write", "Edit") and "handoffs" in str(inp.get("file_path", "")).replace("\\", "/"):
+        return True
+    return name in ("Bash", "PowerShell") and "ctx_hook.py" in str(inp.get("command", ""))
+
+
+def tool_event(data, cfg, home=None):
+    """PreToolUse: (deny_reason, user_message) when a Fable turn runs too long or too big, else (None, None)."""
+    try:
+        with open(turn_file(data.get("session_id"), home), encoding="utf-8") as f:
+            offset = json.load(f).get("offset")
+    except (OSError, ValueError, TypeError, AttributeError):
+        offset = None
+    n, model = turn_requests(data.get("transcript_path"), offset)
+    if "fable" not in str(model) or handoff_call(data):
+        return None, None
+    user = FABLE_USER.get(cfg.get("lang", "en"), FABLE_USER["en"])
+    if cfg["fable_turn_max"] and n >= cfg["fable_turn_max"]:
+        return FABLE_TURN.format(n=n, max=cfg["fable_turn_max"]), user.format(why=f"{n} req")
+    tokens, _ = last_context(data.get("transcript_path"))
+    if tokens and cfg["fable_hard"] and tokens >= cfg["fable_hard"]:
+        k = round(tokens / 1000)
+        return FABLE_CTX.format(k=k, hard=cfg["fable_hard"] // 1000), user.format(why=f"~{k}K ctx")
+    return None, None
+
+
 def emit(event_name, context, message):
     out = {"hookSpecificOutput": {"hookEventName": event_name, "additionalContext": context}}
     if message:
@@ -268,7 +359,7 @@ def emit(event_name, context, message):
 
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("mode", choices=["prompt", "start", "path", "digest"])
+    p.add_argument("mode", choices=["prompt", "start", "tool", "path", "digest"])
     p.add_argument("--cwd", help="folder for `path` (default: current directory)")
     p.add_argument("--transcript", help="transcript for `digest` (default: the newest one)")
     a = p.parse_args(argv)
@@ -284,7 +375,15 @@ def main(argv=None):
         return 0
     try:
         data = json.loads(sys.stdin.buffer.read().decode("utf-8", errors="replace") or "{}")
+        if a.mode == "tool":
+            reason, msg = tool_event(data, cfg)
+            if reason:
+                print(json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
+                                                         "permissionDecisionReason": reason},
+                                  "systemMessage": msg}, ensure_ascii=False))
+            return 0
         if a.mode == "prompt":
+            mark_turn(data)
             ctx, msg = prompt_event(data, cfg)
             event = "UserPromptSubmit"
         else:

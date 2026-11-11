@@ -136,6 +136,7 @@ Hidden drain catalog (178 items, Turkish, labelled): C1–C50 `references/hidden
 |---|---|---|
 | UserPromptSubmit | `scripts/cache_guard.py` **[ClaudeLimit]** | `/model` or `/effort` since the last request at ≥30K context → one-line warning with the rewrite cost |
 | UserPromptSubmit / SessionStart | `scripts/ctx/ctx_hook.py prompt` / `start` | context soft/hard limit, idle cache miss, handoff note pointer/autoload |
+| PreToolUse(*) | `scripts/ctx/ctx_hook.py tool` **[ClaudeLimit]** | Fable brake: on Fable only, denies tools after `fable_turn_max` (25) Fable requests in one user turn or at `fable_hard` (120000) context; handoff tools still run; Opus/Sonnet untouched; 0 turns a limit off (`~/.claude/claudectx.json`) |
 | PreToolUse | `scripts/lean/lean_hook.py` | Read guard (whole-file read of 400+ line text files without `limit`), Write note (Write that repeats most of a file) |
 | UserPromptSubmit | `scripts/lean/lean_hook.py` | reply note after 250+ words of prose or 80+ lines of code in chat |
 | PreToolUse(Bash) | `scripts/hooks/pretool_bash_filter.py` | D1: pipes gradle/mvn/npm test/pytest/go test output through filter_log.py; returns `ask`, never `allow` (Bash only, not PowerShell) |
