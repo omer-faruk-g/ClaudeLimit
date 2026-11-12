@@ -262,7 +262,7 @@ def digest(transcript_path, per_msg=240, cap=10000):
 
 
 FABLE_TURN = ("ClaudeLimit Fable brake: this turn already ran {n} Fable requests (limit {max}). Fable drains the "
-              "5-hour limit about 2x faster than Opus. Do not call more tools. Reply to the user now: what is done, "
+              "5-hour limit about 4-5x faster than Opus per token (one request at ~125K context is ~1% of the window). Do not call more tools. Reply to the user now: what is done, "
               "what is left, and ask whether to continue (their next message allows another {max}).")
 FABLE_CTX = ("ClaudeLimit Fable brake: context is ~{k}K tokens (Fable limit {hard}K) and every Fable request re-sends "
              "all of it. Only the handoff may run now: invoke the claudelimit skill, run its core-context flow "

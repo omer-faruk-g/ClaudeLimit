@@ -16,7 +16,7 @@ DEFAULTS = {
     "idle_min_context": 60000,   # ignore idle gaps for small contexts
     "handoff_max_age_days": 7,   # SessionStart mentions only handoffs newer than this
     "autoload_minutes": 30,      # after /clear, load a note this fresh in full (the core context)
-    "fable_turn_max": 25,        # Fable brake: tool calls stop after this many Fable requests in one turn
+    "fable_turn_max": 15,        # Fable brake: tool calls stop after this many Fable requests in one turn
     "fable_hard": 120000,        # Fable brake: tool calls stop at this context (handoff tools still run)
 }
 

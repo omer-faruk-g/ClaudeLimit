@@ -469,15 +469,15 @@ class TestFableBrake(Base):
         return ctx_hook.tool_event(d, cfg or CFG, home=self.home)
 
     def test_fable_under_limits_allows(self):
-        self.assertEqual(self.run_tool([fable(90000, 1000 + i, f"f{i}") for i in range(24)]), (None, None))
+        self.assertEqual(self.run_tool([fable(90000, 1000 + i, f"f{i}") for i in range(14)]), (None, None))
 
     def test_fable_turn_limit_denies(self):
-        reason, msg = self.run_tool([fable(90000, 1000 + i, f"f{i}") for i in range(25)])
-        self.assertIn("25 Fable requests", reason)
+        reason, msg = self.run_tool([fable(90000, 1000 + i, f"f{i}") for i in range(15)])
+        self.assertIn("15 Fable requests", reason)
         self.assertIn("Fable", msg)
 
     def test_streamed_chunks_count_once(self):
-        e = [fable(90000, 1000 + i, f"f{i // 2}") for i in range(48)]  # 2 transcript lines per request
+        e = [fable(90000, 1000 + i, f"f{i // 2}") for i in range(28)]  # 2 transcript lines per request
         self.assertEqual(self.run_tool(e), (None, None))
 
     def test_previous_turn_not_counted(self):
